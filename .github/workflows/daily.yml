@@ -22,10 +22,10 @@ jobs:
     runs-on: ubuntu-latest          # GitHub 提供的臨時 Linux 機器
     steps:
       # 1) 把 repo 內容抓下來（包含程式和昨天為止的 stock_data.db）
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # 2) 安裝 Python
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 

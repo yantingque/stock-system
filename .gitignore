@@ -1,0 +1,8 @@
+# ---- 秘密（絕對不上傳） ----
+config_local.py
+service_account.json
+
+# ---- Python 與 Jupyter 的暫存 ----
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

@@ -6,3 +6,6 @@ service_account.json
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# ---- 資料庫：改用 GitHub Release（db-latest）存放，不進 git 版本歷史 ----
+stock_data.db

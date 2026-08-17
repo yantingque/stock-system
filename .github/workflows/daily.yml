@@ -1,6 +1,12 @@
 # ================================================================
 # GitHub Actions 排程設定：平日台灣時間 16:30 自動執行每日管線
 # 放置位置固定是 repo 根目錄的 .github/workflows/daily.yml
+#
+# 2026/08 更新：stock_data.db 改用 GitHub Release（db-latest）存放，
+# 不再每天 git commit 回 repo，避免 .git 版本歷史被逐日累積的資料庫塞爆。
+# 前置作業（一次性、手動）：先在 GitHub 網頁建立一個 tag 為 db-latest 的
+# Release，並把目前的 stock_data.db 當附加檔案上傳上去，這個 workflow
+# 才有東西可以下載。
 # ================================================================
 name: daily-stock-pipeline
 
@@ -13,7 +19,7 @@ on:
   # 額外提供「手動觸發」按鈕（Actions 頁面 → Run workflow），測試時用
   workflow_dispatch:
 
-# 允許 workflow 把更新後的資料庫 commit 回 repo
+# contents: write：release 的下載/上傳跟原本的 git push 一樣，都需要這個權限
 permissions:
   contents: write
 
@@ -21,7 +27,7 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest          # GitHub 提供的臨時 Linux 機器
     steps:
-      # 1) 把 repo 內容抓下來（包含程式和昨天為止的 stock_data.db）
+      # 1) 把 repo 內容抓下來（只有程式碼，不會再帶著逐日累積的 stock_data.db）
       - uses: actions/checkout@v5
 
       # 2) 安裝 Python
@@ -33,14 +39,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 4) 把 Google 金鑰（存在 Secrets 裡的 JSON 內容）寫成暫存檔
+      # 4) 從 GitHub Release「db-latest」下載目前最新的資料庫
+      #    ubuntu-latest 內建 gh CLI，GITHUB_TOKEN 由 Actions 自動提供，不用額外設定
+      #    如果 release 還沒建立（例如第一次套用這個 workflow 時），不讓整個
+      #    流程失敗，改成沿用 checkout 下來的舊版 db，並印出警告
+      - name: Download latest database from Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download db-latest --pattern "stock_data.db" --clobber \
+            || echo "⚠️ 找不到 db-latest release，本次先用 repo 內現有的 stock_data.db（請確認已建立 Release）"
+
+      # 5) 把 Google 金鑰（存在 Secrets 裡的 JSON 內容）寫成暫存檔
       #    printf '%s' 原樣輸出，JSON 的換行與符號都不會被動到
       - name: Write Google service account key
         env:
           GSHEET_SERVICE_ACCOUNT_JSON: ${{ secrets.GSHEET_SERVICE_ACCOUNT_JSON }}
         run: printf '%s' "$GSHEET_SERVICE_ACCOUNT_JSON" > service_account.json
 
-      # 5) 執行每日管線；秘密以環境變數注入，config.py 會讀到
+      # 6) 執行每日管線；秘密以環境變數注入，config.py 會讀到
       - name: Run daily pipeline
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
@@ -50,12 +67,10 @@ jobs:
           GSHEET_NAME: ${{ secrets.GSHEET_NAME }}
         run: python daily_run.py
 
-      # 6) 把更新後的資料庫 commit 回 repo（資料因此每天延續累積）
-      #    「git diff --cached --quiet ||」= 有變動才 commit，沒變動安靜跳過
-      - name: Commit updated database
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add stock_data.db
-          git diff --cached --quiet || git commit -m "每日資料更新 $(TZ=Asia/Taipei date +%F)"
-          git push
+      # 7) 把更新後的資料庫覆蓋上傳回同一個 Release
+      #    --clobber = 覆蓋掉舊附件，GitHub 上永遠只留「這一份」，
+      #    不會像 git commit 那樣把每天的版本都永久留在歷史裡
+      - name: Upload updated database to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload db-latest stock_data.db --clobber

@@ -684,7 +684,11 @@ def upload_daily_selection(as_of):
 
 
 def push_line_message(text):
-    """LINE 推播。停用或未設定時安靜跳過。"""
+    """LINE 推播（push，只送給單一 LINE_USER_ID）。停用或未設定時安靜跳過。
+    只用在給管理者自己看的內部通知（例如管線執行異常），不要拿來發日常報告——
+    家人朋友加這個官方帳號好友也收不到，因為 push 是點對點的，只認 LINE_USER_ID
+    這一個人。要讓所有已加好友的人都收到，請改用下面的 broadcast_line_message。
+    """
     if not ENABLE_LINE:
         print("LINE 停用，跳過推播")
         return True
@@ -698,6 +702,27 @@ def push_line_message(text):
         print("推播成功")
         return True
     print(f"推播失敗 HTTP {resp.status_code}：{resp.text}")
+    return False
+
+
+def broadcast_line_message(text):
+    """LINE 廣播（broadcast，發給所有已加這個官方帳號好友的人，包含家人）。
+    停用或未設定時安靜跳過。每日選股報告改用這支函式發送，這樣家人加好友後
+    才會真的收得到；管線異常通知則維持用 push_line_message 只發給你自己。
+    """
+    if not ENABLE_LINE:
+        print("LINE 停用，跳過推播")
+        return True
+    resp = requests.post(
+        "https://api.line.me/v2/bot/message/broadcast",
+        headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+                 "Content-Type": "application/json"},
+        json={"messages": [{"type": "text", "text": text}]},
+        timeout=15)
+    if resp.status_code == 200:
+        print("廣播成功")
+        return True
+    print(f"廣播失敗 HTTP {resp.status_code}：{resp.text}")
     return False
 
 
@@ -812,7 +837,7 @@ def run_pipeline():
     if msg is None:
         log_stage(as_of, "push", "ok", "無達標不推播")
         print("今日無達標股票，依規格不推播")
-    elif push_line_message(msg):
+    elif broadcast_line_message(msg):
         log_stage(as_of, "push", "ok", f"{n} 檔")
     else:
         log_stage(as_of, "push", "fail")

@@ -834,6 +834,27 @@ def upload_daily_selection(as_of):
 
     track_ws.clear()
     track_ws.update([track_header] + rows, value_input_option="USER_ENTERED")
+
+    # 2026-10-28 修復：track_ws.clear() 只清內容、不清格式。這個 Sheet 歷史上
+    # 不同版本的欄位配置用過好幾輪，如果同一個儲存格座標曾經被舊版寫過「日期」
+    # 類型的值，Google Sheets 會把那個儲存格的格式記成日期，之後哪怕 USER_ENTERED
+    # 寫進去的是股價這種單純數字，也會被「借用」殘留的日期格式顯示成一串奇怪的
+    # 日期字串（底層數值其實是對的，只是顯示錯了——例如股價 545 被顯示成
+    # 1901-06-28；股價若非整數，因為日期格式只看整數天，小數部分會被吃掉，
+    # 所以報酬率%算出來會跟顯示的價格對不太起來，不是算錯，是顯示錯）。
+    # 這裡每次更新後都強制把會寫數字的欄位重設回純數字格式，避免這個問題持續發生。
+    numeric_cols = ["D", "F", "G", "H", "I", "J"]  # 進場價/出場價/報酬率%/大盤同期%/超額%/持有天數
+    if rows:
+        n_last_row = len(rows) + 1  # +1 因為第1列是表頭
+        try:
+            track_ws.batch_format([
+                {"range": f"{col}2:{col}{n_last_row}",
+                 "format": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}}
+                for col in numeric_cols
+            ])
+        except Exception as e:
+            print(f"⚠ 推薦追蹤欄位格式重設失敗（不影響資料本身，只是顯示可能還是怪怪的）：{e}")
+
     print(f"推薦追蹤更新：追蹤中 {n_open} 筆、已結算 {n_settled} 筆、異常標記 {n_anomaly} 筆")
 
     _update_performance_summary(rows)

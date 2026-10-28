@@ -307,23 +307,16 @@ def catchup_with_finmind(stock_ids):
     print(f"補跑路徑完成：股價 {total['price']}、法人 {total['inst']}、估值 {total['val']} 筆")
 
 
-# ---------- 大盤指數（補項目5的資料缺口：之前完全沒有存大盤/benchmark資料）----------
-#
-# ⚠️ 這段用 FinMind 的 stock_id="TAIEX" 抓「發行量加權股價指數」，是 FinMind
-# 官方文件記載的慣例用法（跟抓個股用同一支 api.taiwan_stock_daily，只是股票代號
-# 換成 TAIEX），但這個環境沒有 FINMIND_TOKEN、也沒辦法連線實測，所以這段邏輯
-# 還沒有真的跑過一次成功的結果。第一次上線前，麻煩你本機跑一次（例如
-# `python -c "from daily_run import update_benchmark_index; update_benchmark_index()"`），
-# 確認 benchmark_index 表真的有抓到資料、數字合理，再放著讓它每天自動跑。
-# 如果 FinMind 這個 stock_id 不work，備案是改用 TWSE 自己的 openapi 指數端點，
-# 但那個端點的 JSON 欄位名稱我沒有把握，需要你那邊實際印一次 response 看格式。
-
+# 2026-10 新增：大盤指數（TAIEX）補抓，供「推薦追蹤」報表算超額報酬用。
+# ⚠ 尚未在有 FINMIND_TOKEN／可連外網路的環境實測過，部署前請先手動執行一次驗證：
+#   python -c "from daily_run import update_benchmark_index; update_benchmark_index()"
 def update_benchmark_index():
-    """補抓大盤指數（目前只有 TAIEX）到 benchmark_index 表，從資料庫最新日+1 抓到現在。
-    刻意獨立於股票池的更新流程之外、失敗不中斷主管線（呼叫端已包 try/except）。"""
-    # get_latest_date() 預設用 WHERE stock_id=? 篩選，這張表沒有 stock_id 欄位，改直接查
+    """補抓大盤指數（目前只有 TAIEX）到 benchmark_index 表，從資料庫既有最新日期+1
+    抓到現在；完全沒資料時從 2010-01-01 開始。失敗不應中斷主流程，呼叫端自行 try/except。
+    """
     conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT MAX(date) FROM benchmark_index WHERE index_id='TAIEX'").fetchone()
+    row = conn.execute(
+        "SELECT MAX(date) FROM benchmark_index WHERE index_id='TAIEX'").fetchone()
     conn.close()
     latest = row[0] if row else None
     start = next_day(latest) if latest else "2010-01-01"
@@ -332,6 +325,7 @@ def update_benchmark_index():
     if df.empty:
         print(f"大盤指數（TAIEX）無新資料（已從 {start} 查詢）")
         return 0
+
     df = df.rename(columns={"stock_id": "index_id"})
     df["index_id"] = "TAIEX"
     n = upsert_dataframe(df, "benchmark_index", ["index_id", "date", "close"])
@@ -392,8 +386,7 @@ def update_market_data(stock_ids):
     today = now.date()
     today_str = today.isoformat()
 
-    # 大盤指數更新跟股票池防呆邏輯無關，獨立跑一次，失敗不影響主流程
-    # （上線前務必手動驗證過一次，見 update_benchmark_index() 上方的說明）。
+    # 2026-10 新增：大盤指數補抓，獨立 try/except，失敗不影響主流程
     try:
         update_benchmark_index()
     except Exception as e:
@@ -685,6 +678,41 @@ def upload_daily_selection(as_of):
             ws.append_rows([header])
             return ws
 
+    def _update_performance_summary(track_rows):
+        """2026-10 report 改版新增：「績效總表」——只看「已結算」的倉位，
+        依評級分組、抓最近 20 筆（滾動視窗）的表現，讓人一眼看出整體/各評級/
+        最近一段時間的勝率跟平均報酬率，不用自己在「推薦追蹤」裡逐筆算。
+        欄位對應 track_header：0股票代號 1狀態 2進場日 3進場價 4出場日 5出場價
+        6報酬率% 7大盤同期% 8超額% 9持有天數 10首次評級 11異常標記"""
+        settled = [r for r in track_rows if r[1] == "已結算"]
+
+        def _stats(sub):
+            n = len(sub)
+            if n == 0:
+                return [0, "", "", ""]
+            rets = [r[6] for r in sub]
+            win = sum(1 for x in rets if x > 0)
+            return [n, round(win / n * 100, 1), round(sum(rets) / n, 2),
+                    round((sorted(rets)[n // 2] if n % 2 else
+                           (sorted(rets)[n // 2 - 1] + sorted(rets)[n // 2]) / 2), 2)]
+
+        summary_header = ["分組", "筆數", "勝率%", "平均報酬%", "中位數報酬%"]
+        summary_rows = [["整體（全部已結算）"] + _stats(settled)]
+        for g in ["強烈推薦", "觀察清單"]:
+            summary_rows.append([g] + _stats([r for r in settled if r[10] == g]))
+        # 滾動視窗：按出場日排序取最近 N 筆，跟整體比較，看近期是不是變好/變差
+        for n_recent in (20, 50):
+            recent = sorted(settled, key=lambda r: r[4], reverse=True)[:n_recent]
+            summary_rows.append([f"最近{n_recent}筆已結算"] + _stats(recent))
+        n_anomaly = sum(1 for r in settled if r[11])
+        summary_rows.append(["", "", "", "", ""])
+        summary_rows.append([f"異常標記（|報酬率|>{40}%，建議人工核對）", n_anomaly, "", "", ""])
+
+        summary_ws = get_ws("績效總表", summary_header)
+        summary_ws.clear()
+        summary_ws.update([summary_header] + summary_rows, value_input_option="USER_ENTERED")
+        print(f"績效總表更新完成（已結算 {len(settled)} 筆）")
+
     daily_ws = get_ws("每日選股紀錄",
                       ["日期", "股票代號", "總分", "技術面", "基本面", "評級"])
     df = _q("""SELECT as_of, stock_id, total, tech, fund, grade FROM selection_log
@@ -701,7 +729,7 @@ def upload_daily_selection(as_of):
             daily_ws.append_rows(rows, value_input_option="USER_ENTERED")
         print(f"每日選股紀錄新增 {len(rows)} 列")
 
-    # ---- 推薦追蹤（整表重算；2026-10 起改為「固定 20 個交易日結算」）----
+    # ---- 推薦追蹤（整表重算；2026-10 起改為「固定 20 個交易日結算」+ 大盤對照/異常標記）----
     # 設計：每次都從 selection_log 全歷史重新算起（不依賴 Sheet 上次留下的值），
     # 保證可重跑、不會因為中途改規則或補資料而跟舊邏輯的殘留值混在一起。
     #
@@ -710,8 +738,18 @@ def upload_daily_selection(as_of):
     # 結算前都算「追蹤中」（用目前最新收盤算未實現報酬率）。
     # 結算後，若之後又被評為達標才會開下一輪新倉位——不會自動無限期延續，
     # 這樣同一檔股票可能在歷史上出現多輪獨立的 20 日交易紀錄。
+    #
+    # 2026-10 report 改版新增：
+    #   大盤同期報酬%/超額報酬% —— 用 benchmark_index(TAIEX) 算同一段時間大盤漲跌，
+    #     這樣才知道是真的選股有效，還是單純大盤那段時間在漲。benchmark_index
+    #     目前還是空的（見 update_benchmark_index() 的說明，待你本機驗證過
+    #     FinMind 抓取成功後才會有資料），沒資料時這兩欄留空，不會讓程式出錯。
+    #   異常標記 —— |報酬率|>40% 的列印出來提醒人工核對，這類極端值常常是減資/
+    #     分割等公司事件造成的價格不連續，不是真的交易績效（沿用之前分析
+    #     Google Sheet 歷史資料時，3443/6669 兩檔抓到的同一個模式）。
     track_header = ["股票代號", "狀態", "進場日", "進場價", "出場日/最新日",
-                    "出場價/最新價", "報酬率%", "持有交易日數", "首次評級"]
+                    "出場價/最新價", "報酬率%", "大盤同期報酬%", "超額報酬%",
+                    "持有交易日數", "首次評級", "異常標記"]
     track_ws = get_ws("推薦追蹤", track_header)
 
     conn = sqlite3.connect(DB_PATH)
@@ -722,12 +760,20 @@ def upload_daily_selection(as_of):
                            (sid, d)).fetchone()
         return row if row else (None, None)
 
+    def benchmark_close_on_or_before(d):
+        row = conn.execute("""SELECT close FROM benchmark_index
+                              WHERE index_id='TAIEX' AND date<=? ORDER BY date DESC LIMIT 1""",
+                           (d,)).fetchone()
+        return row[0] if row else None
+
+    ANOMALY_THRESHOLD = 40  # |報酬率|超過這個百分比就標記，門檻沿用之前分析歷史資料時的經驗值
+
     all_dates = pd.read_sql("SELECT DISTINCT date FROM daily_price ORDER BY date", conn)["date"].tolist()
     date_pos = {d: i for i, d in enumerate(all_dates)}
     glog = pd.read_sql("""SELECT as_of, stock_id, grade FROM selection_log
                           WHERE grade != '-' ORDER BY stock_id, as_of""", conn)
 
-    rows, n_settled, n_open = [], 0, 0
+    rows, n_settled, n_open, n_anomaly = [], 0, 0, 0
     for sid, sub in glog.groupby("stock_id"):
         open_until = None   # None=沒有持倉；"9999-12-31"=持倉中但結算日還不確定；其他=已排定的結算日
         for entry_date, grade in sub[["as_of", "grade"]].itertuples(index=False):
@@ -764,8 +810,21 @@ def upload_daily_selection(as_of):
                 open_until = "9999-12-31"
                 n_open += 1
 
+            bm_entry = benchmark_close_on_or_before(entry_date)
+            bm_disp = benchmark_close_on_or_before(disp_date)
+            if bm_entry and bm_disp:
+                bm_ret = round((bm_disp / bm_entry - 1) * 100, 2)
+                excess_ret = round(ret - bm_ret, 2)
+            else:
+                bm_ret, excess_ret = "", ""  # benchmark_index 還沒有資料時留空，不報錯
+
+            anomaly = ""
+            if abs(ret) > ANOMALY_THRESHOLD:
+                anomaly = "⚠請核對(可能減資/分割)"
+                n_anomaly += 1
+
             rows.append([sid, status, entry_date, entry_price, disp_date, disp_price,
-                        ret, held, grade])
+                        ret, bm_ret, excess_ret, held, grade, anomaly])
     conn.close()
 
     # 排序：追蹤中（目前還看得到、可能還會變動）排前面，已結算（歷史定案）排後面；
@@ -775,7 +834,9 @@ def upload_daily_selection(as_of):
 
     track_ws.clear()
     track_ws.update([track_header] + rows, value_input_option="USER_ENTERED")
-    print(f"推薦追蹤更新：追蹤中 {n_open} 筆、已結算 {n_settled} 筆")
+    print(f"推薦追蹤更新：追蹤中 {n_open} 筆、已結算 {n_settled} 筆、異常標記 {n_anomaly} 筆")
+
+    _update_performance_summary(rows)
 
 
 def push_line_message(text):

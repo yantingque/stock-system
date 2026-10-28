@@ -396,6 +396,11 @@ print("資料更新函式就緒")
 #                    ★ 策 略 區（要改選股方式改這裡）★
 # ==================================================================
 
+# ---- 推薦追蹤結算天數：每筆推薦固定持有這麼多個「交易日」後結算（不是日曆天）----
+# 2026-10 起改為固定 20 個交易日結算（原本是「無限期累積到現在」），
+# 理由：讓「推薦追蹤」跟回測的評估慣例（20 個交易日）一致，才能互相比較。
+SETTLE_AFTER_DAYS = 20
+
 # ---- 提案 v1 的所有參數（門檻集中管理，不埋在程式裡） ----
 PROPOSAL_PARAMS = {
     # 評級門檻
@@ -636,51 +641,81 @@ def upload_daily_selection(as_of):
             daily_ws.append_rows(rows, value_input_option="USER_ENTERED")
         print(f"每日選股紀錄新增 {len(rows)} 列")
 
-    # ---- 推薦追蹤（整表重算） ----
-    track_header = ["股票代號", "首次推薦日", "進場價", "最新日期", "最新收盤",
-                    "累積報酬率%", "持有天數", "首次評級"]
+    # ---- 推薦追蹤（整表重算；2026-10 起改為「固定 20 個交易日結算」）----
+    # 設計：每次都從 selection_log 全歷史重新算起（不依賴 Sheet 上次留下的值），
+    # 保證可重跑、不會因為中途改規則或補資料而跟舊邏輯的殘留值混在一起。
+    #
+    # 規則：一檔股票被評為達標（觀察清單/強烈推薦）那天開一個新倉位，
+    # 持有到「滿 SETTLE_AFTER_DAYS 個交易日」那天結算（出場價＝那天收盤）；
+    # 結算前都算「追蹤中」（用目前最新收盤算未實現報酬率）。
+    # 結算後，若之後又被評為達標才會開下一輪新倉位——不會自動無限期延續，
+    # 這樣同一檔股票可能在歷史上出現多輪獨立的 20 日交易紀錄。
+    track_header = ["股票代號", "狀態", "進場日", "進場價", "出場日/最新日",
+                    "出場價/最新價", "報酬率%", "持有交易日數", "首次評級"]
     track_ws = get_ws("推薦追蹤", track_header)
 
     conn = sqlite3.connect(DB_PATH)
-    def close_on(sid, d):
+
+    def close_on_or_before(sid, d):
         row = conn.execute("""SELECT date, close FROM daily_price
                               WHERE stock_id=? AND date<=? ORDER BY date DESC LIMIT 1""",
                            (sid, d)).fetchone()
         return row if row else (None, None)
 
-    first = pd.read_sql("""SELECT stock_id, MIN(as_of) AS first_date
-                           FROM selection_log WHERE grade != '-'
-                           GROUP BY stock_id""", conn)
-    glog = pd.read_sql("SELECT as_of, stock_id, grade FROM selection_log WHERE grade != '-'", conn)
-    gmap = {(r["stock_id"], r["as_of"]): r["grade"] for _, r in glog.iterrows()}
+    all_dates = pd.read_sql("SELECT DISTINCT date FROM daily_price ORDER BY date", conn)["date"].tolist()
+    date_pos = {d: i for i, d in enumerate(all_dates)}
+    glog = pd.read_sql("""SELECT as_of, stock_id, grade FROM selection_log
+                          WHERE grade != '-' ORDER BY stock_id, as_of""", conn)
 
-    values = track_ws.get_all_values()
-    kept = {r[0]: (r[1], r[2], r[7]) for r in values[1:]} if len(values) > 1 else {}
+    rows, n_settled, n_open = [], 0, 0
+    for sid, sub in glog.groupby("stock_id"):
+        open_until = None   # None=沒有持倉；"9999-12-31"=持倉中但結算日還不確定；其他=已排定的結算日
+        for entry_date, grade in sub[["as_of", "grade"]].itertuples(index=False):
+            if open_until is not None and entry_date <= open_until:
+                continue  # 還在同一輪持倉期間內，當天的推薦不開新倉
 
-    rows = []
-    for _, r in first.iterrows():
-        sid, fd = r["stock_id"], r["first_date"]
-        if sid in kept:
-            fd, entry_s, fgrade = kept[sid]
-            entry = float(entry_s)
-        else:
-            _, entry = close_on(sid, fd)
-            if entry is None:
+            if entry_date not in date_pos:
                 continue
-            fgrade = gmap.get((sid, fd), "")
-        last_d, last_c = close_on(sid, "9999-12-31")
-        if last_c is None:
-            continue
-        ret = round((last_c / entry - 1) * 100, 2)
-        days = (datetime.strptime(last_d, "%Y-%m-%d").date()
-                - datetime.strptime(str(fd), "%Y-%m-%d").date()).days
-        rows.append([sid, fd, entry, last_d, last_c, ret, days, fgrade])
+            idx_entry = date_pos[entry_date]
+            target_idx = idx_entry + SETTLE_AFTER_DAYS
+
+            _, entry_price = close_on_or_before(sid, entry_date)
+            if entry_price is None:
+                continue
+
+            if target_idx < len(all_dates):
+                settle_date = all_dates[target_idx]
+                exit_date, exit_price = close_on_or_before(sid, settle_date)
+                if exit_price is None:
+                    open_until = "9999-12-31"   # 股票停牌等缺資料，先當成持倉中，下次再試
+                    continue
+                status = "已結算"
+                disp_date, disp_price = exit_date, exit_price
+                ret = round((exit_price / entry_price - 1) * 100, 2)
+                held = SETTLE_AFTER_DAYS
+                open_until = settle_date
+                n_settled += 1
+            else:
+                status = "追蹤中"
+                latest_date, latest_price = close_on_or_before(sid, "9999-12-31")
+                disp_date, disp_price = latest_date, latest_price
+                ret = round((latest_price / entry_price - 1) * 100, 2)
+                held = date_pos.get(latest_date, idx_entry) - idx_entry
+                open_until = "9999-12-31"
+                n_open += 1
+
+            rows.append([sid, status, entry_date, entry_price, disp_date, disp_price,
+                        ret, held, grade])
     conn.close()
 
-    rows.sort(key=lambda r: r[5], reverse=True)
+    # 排序：追蹤中（目前還看得到、可能還會變動）排前面，已結算（歷史定案）排後面；
+    # 組內都按報酬率高到低。
+    status_order = {"追蹤中": 0, "已結算": 1}
+    rows.sort(key=lambda r: (status_order[r[1]], -r[6]))
+
     track_ws.clear()
     track_ws.update([track_header] + rows, value_input_option="USER_ENTERED")
-    print(f"推薦追蹤更新 {len(rows)} 檔")
+    print(f"推薦追蹤更新：追蹤中 {n_open} 筆、已結算 {n_settled} 筆")
 
 
 def push_line_message(text):

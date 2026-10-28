@@ -95,7 +95,7 @@ def next_day(date_str):
 
 
 def ensure_extra_tables():
-    """建立整合版新增的兩張表（已存在則跳過）。"""
+    """建立整合版新增的幾張表（已存在則跳過）。"""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stock_info (
@@ -110,6 +110,15 @@ def ensure_extra_tables():
             status   TEXT,               -- ok / fail / skip
             message  TEXT,
             PRIMARY KEY (run_at, stage)
+        )""")
+    # 2026-10 新增：大盤指數（目前只存加權指數 TAIEX），獨立成一張表，不混進
+    # daily_price——避免「指數」被 get_pool_ids() 誤當成股票拿去選股評分。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS benchmark_index (
+            index_id TEXT NOT NULL,      -- 目前只有 'TAIEX'（發行量加權股價指數）
+            date     TEXT NOT NULL,
+            close    REAL,
+            PRIMARY KEY (index_id, date)
         )""")
     conn.commit()
     conn.close()
@@ -298,6 +307,38 @@ def catchup_with_finmind(stock_ids):
     print(f"補跑路徑完成：股價 {total['price']}、法人 {total['inst']}、估值 {total['val']} 筆")
 
 
+# ---------- 大盤指數（補項目5的資料缺口：之前完全沒有存大盤/benchmark資料）----------
+#
+# ⚠️ 這段用 FinMind 的 stock_id="TAIEX" 抓「發行量加權股價指數」，是 FinMind
+# 官方文件記載的慣例用法（跟抓個股用同一支 api.taiwan_stock_daily，只是股票代號
+# 換成 TAIEX），但這個環境沒有 FINMIND_TOKEN、也沒辦法連線實測，所以這段邏輯
+# 還沒有真的跑過一次成功的結果。第一次上線前，麻煩你本機跑一次（例如
+# `python -c "from daily_run import update_benchmark_index; update_benchmark_index()"`），
+# 確認 benchmark_index 表真的有抓到資料、數字合理，再放著讓它每天自動跑。
+# 如果 FinMind 這個 stock_id 不work，備案是改用 TWSE 自己的 openapi 指數端點，
+# 但那個端點的 JSON 欄位名稱我沒有把握，需要你那邊實際印一次 response 看格式。
+
+def update_benchmark_index():
+    """補抓大盤指數（目前只有 TAIEX）到 benchmark_index 表，從資料庫最新日+1 抓到現在。
+    刻意獨立於股票池的更新流程之外、失敗不中斷主管線（呼叫端已包 try/except）。"""
+    # get_latest_date() 預設用 WHERE stock_id=? 篩選，這張表沒有 stock_id 欄位，改直接查
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT MAX(date) FROM benchmark_index WHERE index_id='TAIEX'").fetchone()
+    conn.close()
+    latest = row[0] if row else None
+    start = next_day(latest) if latest else "2010-01-01"
+
+    df = api.taiwan_stock_daily(stock_id="TAIEX", start_date=start)
+    if df.empty:
+        print(f"大盤指數（TAIEX）無新資料（已從 {start} 查詢）")
+        return 0
+    df = df.rename(columns={"stock_id": "index_id"})
+    df["index_id"] = "TAIEX"
+    n = upsert_dataframe(df, "benchmark_index", ["index_id", "date", "close"])
+    print(f"大盤指數（TAIEX）更新 {n} 筆（{start} 之後）")
+    return n
+
+
 # ---------- 低頻更新（月營收/季報，沿用原本的節奏） ----------
 
 def lowfreq_update(stock_ids):
@@ -350,6 +391,13 @@ def update_market_data(stock_ids):
     now = now_taipei()
     today = now.date()
     today_str = today.isoformat()
+
+    # 大盤指數更新跟股票池防呆邏輯無關，獨立跑一次，失敗不影響主流程
+    # （上線前務必手動驗證過一次，見 update_benchmark_index() 上方的說明）。
+    try:
+        update_benchmark_index()
+    except Exception as e:
+        print(f"⚠ 大盤指數更新失敗（不影響主流程）：{e}")
 
     # 防呆 0：今天的資料已經在庫裡 → 同日重跑，什麼都不用抓
     if get_latest_date("daily_price") == today_str:

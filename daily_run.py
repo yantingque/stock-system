@@ -180,6 +180,46 @@ print("工具與資料表就緒")
 
 # ---------- 當日路徑：證交所快速更新（日期已被 T86 確認） ----------
 
+class StaleTwseData(Exception):
+    """證交所 OpenAPI 回傳的仍是「前一個交易日」的資料（尚未更新）。"""
+
+
+def _previous_trading_date(table, date_str):
+    """資料庫裡 date_str 之前最近的一個日期；沒有就回傳 None。"""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(f"SELECT MAX(date) FROM {table} WHERE date < ?", (date_str,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def _same_as_previous(rows, table, prev_date, cols, min_ratio=0.9, min_n=30):
+    """2026-11 新增：判斷剛抓到的 rows 是不是跟資料庫裡 prev_date 那天「一模一樣」。
+
+    STOCK_DAY_ALL / BWIBBU_ALL 這兩支 OpenAPI 沒有日期參數，證交所偶爾還沒更新完，
+    會回傳前一個交易日的資料。原本程式直接蓋上今天的日期寫進資料庫，造成
+    2026-09-01、10-06、10-14 三天的股價（以及幾天的估值）其實是前一天的複製品。
+    正常交易日裡，九成以上股票的收盤價「和」成交量同時跟前一天一樣，實務上不可能發生，
+    所以用這個比例當判斷門檻。
+    """
+    if not prev_date or not rows:
+        return False
+    conn = sqlite3.connect(DB_PATH)
+    prev = pd.read_sql(f"SELECT stock_id, {', '.join(cols)} FROM {table} WHERE date = ?",
+                       conn, params=(prev_date,))
+    conn.close()
+    if prev.empty:
+        return False
+    new = pd.DataFrame(rows)[["stock_id"] + cols]
+    m = new.merge(prev, on="stock_id", suffixes=("_new", "_old"))
+    if len(m) < min_n:
+        return False
+    same = pd.Series(True, index=m.index)
+    for c in cols:
+        a, b = m[f"{c}_new"], m[f"{c}_old"]
+        same &= (a == b) | (a.isna() & b.isna())
+    return same.mean() >= min_ratio
+
+
 def fetch_t86(query_date):
     """以日期參數查詢 T86 三大法人。回傳 payload dict；非交易日/未公布時 stat 不是 OK。"""
     url = "https://www.twse.com.tw/rwd/zh/fund/T86"
@@ -213,6 +253,10 @@ def fresh_update_from_twse(trade_date, t86_payload, stock_ids):
                          "low": clean_number(item.get("LowestPrice")),
                          "close": close,
                          "volume": clean_number(item.get("TradeVolume"))})
+    # 2026-11 新增：股價跟前一個交易日完全相同 → 證交所還沒更新，不寫入，交給呼叫端改走 FinMind
+    prev_d = _previous_trading_date("daily_price", d)
+    if _same_as_previous(rows, "daily_price", prev_d, ["close", "volume"]):
+        raise StaleTwseData(f"STOCK_DAY_ALL 回傳的資料與 {prev_d} 完全相同，判定為證交所尚未更新")
     n1 = upsert_dataframe(pd.DataFrame(rows), "daily_price",
                           ["stock_id", "date", "open", "high", "low", "close", "volume"])
     upsert_dataframe(pd.DataFrame(snap), "market_snapshot",
@@ -227,8 +271,14 @@ def fresh_update_from_twse(trade_date, t86_payload, stock_ids):
               "pbr": clean_number(it.get("PBratio")),
               "dividend_yield": clean_number(it.get("DividendYield"))}
              for it in resp.json() if it.get("Code") in stock_ids]
-    n2 = upsert_dataframe(pd.DataFrame(vrows), "valuation",
-                          ["stock_id", "date", "per", "pbr", "dividend_yield"])
+    # 2026-11 新增：估值跟前一個交易日完全相同 → 先不寫，之後由 repair_recent_data() 用 FinMind 補
+    prev_v = _previous_trading_date("valuation", d)
+    if _same_as_previous(vrows, "valuation", prev_v, ["per", "pbr", "dividend_yield"]):
+        print(f"⚠ BWIBBU_ALL 估值與 {prev_v} 完全相同，判定尚未更新，本次不寫入估值")
+        n2 = 0
+    else:
+        n2 = upsert_dataframe(pd.DataFrame(vrows), "valuation",
+                              ["stock_id", "date", "per", "pbr", "dividend_yield"])
 
     # ---- 法人（沿用剛才查 T86 拿到的 payload，不用再請求一次） ----
     fields = t86_payload["fields"]
@@ -378,9 +428,144 @@ def lowfreq_update(stock_ids):
                 print(f"  ⚠ {sid} 財報失敗：{e}")
 
 
+# ---------- 資料修復：找出最近的「重複日」與「缺漏日」並用 FinMind 重抓（2026-11 新增） ----------
+
+REPAIR_LOOKBACK_DAYS = 150     # 往回檢查幾個日曆天
+REPAIR_MAX_ATTEMPTS = 3        # 同一天最多重抓幾次（FinMind 也沒有資料時，避免每天無限重抓）
+
+
+def _find_suspect_dates(table, cols, since, check_stale=True):
+    """回傳 (重複日, 缺漏日)。
+    重複日：九成以上股票的 cols 跟前一個日期完全相同。
+    缺漏日：大盤指數（benchmark_index 的 TAIEX）有開盤、但這張表沒有資料的日期。"""
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql(f"SELECT stock_id, date, {', '.join(cols)} FROM {table} WHERE date >= ?",
+                     conn, params=(since,))
+    cal = pd.read_sql("SELECT date FROM benchmark_index WHERE index_id='TAIEX' AND date >= ?",
+                      conn, params=(since,))["date"]
+    conn.close()
+    if df.empty:
+        return [], []
+    dates = sorted(df["date"].unique())
+    stale = []
+    for prev, cur in (zip(dates, dates[1:]) if check_stale else []):
+        a = df[df["date"] == prev].set_index("stock_id")[cols]
+        b = df[df["date"] == cur].set_index("stock_id")[cols]
+        common = a.index.intersection(b.index)
+        if len(common) < 30:
+            continue
+        a, b = a.loc[common], b.loc[common]
+        same = ((a == b) | (a.isna() & b.isna())).all(axis=1)
+        if same.mean() >= 0.9:
+            stale.append(cur)
+    latest = dates[-1]
+    missing = sorted(set(d for d in cal if d <= latest) - set(dates))
+    return stale, missing
+
+
+def _repair_attempts(conn, date, kind):
+    row = conn.execute("SELECT attempts FROM data_repair WHERE date=? AND kind=?",
+                       (date, kind)).fetchone()
+    return row[0] if row else 0
+
+
+def repair_recent_data(stock_ids):
+    """檢查最近 REPAIR_LOOKBACK_DAYS 天的股價、估值與法人，發現「跟前一天一模一樣」或
+    「大盤有開盤但沒資料」的日期，就用 FinMind 依日期重抓、覆蓋寫入。
+    平常沒有問題時只做資料庫查詢，不會呼叫任何 API。"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS data_repair (
+            date        TEXT,
+            kind        TEXT,            -- price / valuation
+            attempts    INTEGER,
+            last_rows   INTEGER,
+            last_try_at TEXT,
+            PRIMARY KEY (date, kind)
+        )""")
+    conn.commit()
+    since = (now_taipei().date() - timedelta(days=REPAIR_LOOKBACK_DAYS)).isoformat()
+
+    jobs = {}
+    # 法人資料來自 T86（用日期查詢），不會有「舊資料蓋新日期」的問題，所以只檢查缺漏
+    for kind, table, cols, check_stale in [
+            ("price", "daily_price", ["close", "volume"], True),
+            ("valuation", "valuation", ["per", "pbr", "dividend_yield"], True),
+            ("institutional", "institutional", ["net"], False)]:
+        stale, missing = _find_suspect_dates(table, cols, since, check_stale)
+        todo = [d for d in sorted(set(stale) | set(missing))
+                if _repair_attempts(conn, d, kind) < REPAIR_MAX_ATTEMPTS]
+        if todo:
+            print(f"資料檢查：{table} 發現需要修復的日期 {todo}"
+                  f"（重複 {len(stale)} 天、缺漏 {len(missing)} 天）")
+            jobs[kind] = (table, todo, set(stale))
+    conn.close()
+    if not jobs:
+        print(f"資料檢查：最近 {REPAIR_LOOKBACK_DAYS} 天的股價、估值、法人都沒有發現重複或缺漏")
+        return
+
+    fetchers = {
+        "price": (api.taiwan_stock_daily,
+                  {"max": "high", "min": "low", "Trading_Volume": "volume"},
+                  ["stock_id", "date", "open", "high", "low", "close", "volume"]),
+        "valuation": (api.taiwan_stock_per_pbr,
+                      {"PER": "per", "PBR": "pbr"},
+                      ["stock_id", "date", "per", "pbr", "dividend_yield"]),
+        "institutional": (api.taiwan_stock_institutional_investors,
+                          {},
+                          ["stock_id", "date", "name", "buy", "sell", "net"]),
+    }
+    for kind, (table, todo, stale_set) in jobs.items():
+        fetch, rename, cols = fetchers[kind]
+        start, end = min(todo), max(todo)
+        written = {d: 0 for d in todo}
+        for sid in stock_ids:
+            try:
+                df = fetch(stock_id=sid, start_date=start, end_date=end)
+                if not df.empty:
+                    df = df.rename(columns=rename)
+                    df = df[df["date"].isin(todo)].copy()
+                    if kind == "institutional":
+                        df["net"] = df["buy"] - df["sell"]
+                    upsert_dataframe(df, table, cols)
+                    for d, n in df["date"].value_counts().items():
+                        written[d] += int(n)
+                time.sleep(0.3)
+            except Exception as e:
+                print(f"  ⚠ {sid} {kind} 修復失敗：{e}")
+
+        conn = sqlite3.connect(DB_PATH)
+        for d in todo:
+            # 重複日的全市場快照也是同一份舊資料，修復成功就刪掉，避免被誤用
+            if kind == "price" and d in stale_set and written[d] > 0:
+                conn.execute("DELETE FROM market_snapshot WHERE date=?", (d,))
+            conn.execute("""
+                INSERT INTO data_repair (date, kind, attempts, last_rows, last_try_at)
+                VALUES (?, ?, 1, ?, ?)
+                ON CONFLICT(date, kind) DO UPDATE SET
+                    attempts = attempts + 1, last_rows = excluded.last_rows,
+                    last_try_at = excluded.last_try_at""",
+                (d, kind, written[d], now_taipei().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        conn.close()
+        summary = ", ".join(f"{d}:{n}" for d, n in written.items())
+        print(f"資料修復完成（{table}）：{summary}")
+        log_stage(max(todo), f"repair_{kind}", "ok", summary)
+
+
 # ---------- 更新總調度（防呆的核心） ----------
 
 def update_market_data(stock_ids):
+    """資料更新總入口：先更新，再檢查並修復最近的重複／缺漏日期（2026-11 新增）。"""
+    as_of = _update_market_data_core(stock_ids)
+    try:
+        repair_recent_data(stock_ids)
+    except Exception as e:
+        print(f"⚠ 資料修復檢查失敗（不影響主流程）：{e}")
+    return get_latest_date("daily_price") or as_of
+
+
+def _update_market_data_core(stock_ids):
     """依時間與資料狀態自動選擇當日/補跑路徑。回傳更新後資料庫的最新交易日。"""
     now = now_taipei()
     today = now.date()
@@ -401,10 +586,14 @@ def update_market_data(stock_ids):
     if today.weekday() < 5 and now.hour >= 15:
         t86 = fetch_t86(today)
         if t86.get("stat") == "OK":
-            fresh_update_from_twse(today, t86, stock_ids)
-            lowfreq_update(stock_ids)
-            return today_str
-        print(f"T86 尚無今日資料（stat={t86.get('stat')}）→ 改走補跑路徑")
+            try:
+                fresh_update_from_twse(today, t86, stock_ids)
+                lowfreq_update(stock_ids)
+                return today_str
+            except StaleTwseData as e:
+                print(f"⚠ {e} → 改走 FinMind 補跑路徑")
+        else:
+            print(f"T86 尚無今日資料（stat={t86.get('stat')}）→ 改走補跑路徑")
 
     # 防呆 2：補跑前先確認「有沒有缺口」——已是最新就不要浪費 300 次請求
     # expected = 目前理論上「最近一個已收盤的平日」：

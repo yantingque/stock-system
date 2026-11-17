@@ -12,13 +12,13 @@
 - **規則式評分選股**：技術面 50 分＋基本面／籌碼面 50 分，滿分 100 分，依分數分為「強烈推薦」與「觀察清單」
 - **Google Sheet 追蹤**：每日選股紀錄、每檔股票推薦後的累積報酬
 - **LINE 推播**：每日選股報告以廣播（broadcast）發給所有已加官方帳號好友的人；管線異常則以私訊（push）只通知管理者
-- **全自動排程**：GitHub Actions 平日台灣時間 16:30 執行
+- **全自動排程**：GitHub Actions 平日台灣時間 17:47 執行
 
 ## 系統流程
 
 ```mermaid
 flowchart LR
-    A[GitHub Actions<br/>平日 16:30] --> B[下載資料庫<br/>Release: db-latest]
+    A[GitHub Actions<br/>平日 17:47] --> B[下載資料庫<br/>Release: db-latest]
     B --> C[① 資料更新<br/>TWSE → FinMind 備援]
     C --> D[② 評分選股<br/>proposal_v1]
     D --> E[③ 寫入 Google Sheet]
@@ -77,6 +77,7 @@ stock-system/
 | `balance_sheet` | 資產負債表科目（股東權益） | FinMind |
 | `selection_log` | 每日評分結果 | 本系統 |
 | `run_log` | 每次執行各步驟的成功／失敗紀錄 | 本系統 |
+| `data_repair` | 自動資料修復的紀錄（日期、類別、重抓筆數） | 本系統 |
 | `stock_info` | 股票代號與名稱 | 本系統 |
 
 資料庫每天會變大（已超過 140MB），所以**不 commit 進 git**，而是存成 GitHub Release（tag：`db-latest`）的附件，每次執行完用 `--clobber` 覆蓋上傳，GitHub 上永遠只保留最新一份。
@@ -99,7 +100,7 @@ Settings → Secrets and variables → Actions → New repository secret：
 | `GSHEET_NAME` | Google Sheet 名稱（預設：選股系統追蹤） |
 
 ### 3. 執行
-- 自動：平日 UTC 08:30（台灣 16:30）
+- 自動：平日 UTC 09:47（台灣 17:47）
 - 手動：Actions → daily-stock-pipeline → **Run workflow**
 
 > GitHub 排程不保證準時，尖峰時段可能延遲 10～30 分鐘；程式內建日期防呆，延遲或重跑都不會重複推播。
@@ -132,6 +133,8 @@ python daily_run.py
 ## 容錯設計
 
 - **雙路徑資料更新**：證交所當日資料優先，失敗或尚未更新時自動改用 FinMind 補缺口
+- **舊資料偵測**：證交所 OpenAPI 偶爾還沒更新、回傳前一天的資料，程式會比對前一個交易日，完全相同就不寫入，改走 FinMind
+- **自動資料修復**：每次執行都檢查最近 150 天的股價、估值、法人，發現「跟前一天一模一樣」或「大盤有開盤卻沒資料」的日期，就用 FinMind 依日期重抓覆蓋，修復紀錄存在 `data_repair` 表
 - **日期防呆**：一律以台灣時區判斷；同日重跑、假日、連假後執行都能得到正確的基準日
 - **防重複推播**：同一交易日已推播過就不再推播
 - **非關鍵站隔離**：Google Sheet 失敗不影響 LINE 推播
